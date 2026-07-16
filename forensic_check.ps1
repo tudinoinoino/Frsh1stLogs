@@ -1,4 +1,8 @@
 $flags = @()
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "Attenzione: sessione non elevata - i servizi disabilitati verranno solo segnalati, non riattivati. Rilancia come Amministratore per la remediation automatica." -ForegroundColor DarkYellow
+}
 
 Write-Host "SYSTEM BOOT TIME" -ForegroundColor Cyan
 $os = Get-CimInstance Win32_OperatingSystem
@@ -6,6 +10,17 @@ $boot = $os.LastBootUpTime
 $uptime = (Get-Date) - $boot
 Write-Host "  Last Boot: $boot"
 Write-Host "  Uptime: $($uptime.Days) days, $($uptime.Hours):$($uptime.Minutes):$($uptime.Seconds)"
+
+$explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
+if ($explorer) {
+    $explorerStart = $explorer.CreationDate
+    $delay = $explorerStart - $boot
+    Write-Host "  Explorer.exe avviato: $explorerStart (dopo $([math]::Round($delay.TotalSeconds,1))s dal boot)"
+    if ($delay.TotalMinutes -gt 5) { $flags += "Explorer.exe avviato con oltre 5 minuti di ritardo dal boot - possibile avvio manuale/ritardato o sessione anomala" }
+} else {
+    Write-Host "  Explorer.exe non in esecuzione" -ForegroundColor Yellow
+    $flags += "explorer.exe non risulta in esecuzione"
+}
 
 Write-Host "`nCONNECTED DRIVES" -ForegroundColor Cyan
 Get-CimInstance Win32_LogicalDisk | ForEach-Object {
@@ -35,6 +50,20 @@ foreach ($name in $svcNames.Keys) {
         $flags += "$name e' impostato su Disabled (start type), non solo fermo - anomalia forte"
     } elseif ($svc.Status -ne 'Running') {
         $flags += "$name risulta fermo (potrebbe essere normale o indicare interferenza)"
+    }
+
+    if ($svc.StartType -eq 'Disabled' -or $svc.Status -ne 'Running') {
+        if ($isAdmin) {
+            try {
+                if ($svc.StartType -eq 'Disabled') { Set-Service -Name $name -StartupType Automatic -ErrorAction Stop }
+                if ($svc.Status -ne 'Running') { Start-Service -Name $name -ErrorAction Stop }
+                Write-Host "    -> Riattivato: StartType=Automatic, Status=Running" -ForegroundColor Green
+            } catch {
+                Write-Host "    -> Impossibile riattivare $name : $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+        } else {
+            Write-Host "    -> Serve PowerShell come Amministratore per riattivarlo automaticamente" -ForegroundColor DarkYellow
+        }
     }
 }
 
@@ -77,7 +106,8 @@ if ($timeChange) {
     $flags += "Rilevato cambio manuale dell'orologio di sistema (Event ID 4616) - possibile tentativo di alterare timestamp"
 }
 
-$usn = fsutil usn queryjournal C: 2>&1
+$fsutilPath = "$env:WINDIR\System32\fsutil.exe"
+$usn = & $fsutilPath usn queryjournal C: 2>&1
 if ($usn -match "not found" -or $usn -match "non trovato" -or $LASTEXITCODE -ne 0) {
     Write-Host "  USN Journal: non trovato/vuoto" -ForegroundColor Red
     $flags += "USN Journal assente - potrebbe essere stato cancellato (fsutil usn deletejournal) per rimuovere tracce filesystem"
