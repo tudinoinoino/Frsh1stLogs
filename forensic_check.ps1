@@ -15,10 +15,12 @@ $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select
 if ($explorer) {
     $explorerStart = $explorer.CreationDate
     $delay = $explorerStart - $boot
-    Write-Host "  Explorer.exe avviato: $explorerStart (dopo $([math]::Round($delay.TotalSeconds,1))s dal boot)"
-    if ($delay.TotalMinutes -gt 5) { $flags += "Explorer.exe avviato con oltre 5 minuti di ritardo dal boot - possibile avvio manuale/ritardato o sessione anomala" }
+    $suspicious = $delay.TotalMinutes -gt 5
+    $c = if ($suspicious) { 'Red' } else { 'Green' }
+    Write-Host "  Explorer.exe avviato: $explorerStart (dopo $([math]::Round($delay.TotalSeconds,1))s dal boot)" -ForegroundColor $c
+    if ($suspicious) { $flags += "Explorer.exe avviato con oltre 5 minuti di ritardo dal boot - possibile avvio manuale/ritardato o sessione anomala" }
 } else {
-    Write-Host "  Explorer.exe non in esecuzione" -ForegroundColor Yellow
+    Write-Host "  Explorer.exe non in esecuzione" -ForegroundColor Red
     $flags += "explorer.exe non risulta in esecuzione"
 }
 
@@ -68,7 +70,14 @@ Write-Host "  Prefetch Enabled: $(if ($prefetch -gt 0) {'Enabled'} else {'Disabl
 if ($prefetch -eq 0) { $flags += "Prefetch disabilitato - riduce evidenza di esecuzione programmi" }
 
 Write-Host "`nEVENT LOGS" -ForegroundColor Cyan
-$secCleared = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=1102} -MaxEvents 5 -ErrorAction SilentlyContinue
+$sysEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104,1074,6006} -MaxEvents 20 -ErrorAction SilentlyContinue
+$sysCleared = $sysEvents | Where-Object Id -eq 104
+$shutdown = $sysEvents | Where-Object { $_.Id -in 1074,6006 } | Select-Object -First 1
+
+$secEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=1102,4616} -MaxEvents 20 -ErrorAction SilentlyContinue
+$secCleared = $secEvents | Where-Object Id -eq 1102
+$timeChange = $secEvents | Where-Object Id -eq 4616 | Select-Object -First 1
+
 if ($secCleared) {
     foreach ($e in $secCleared) { Write-Host "  Security log cleared at: $($e.TimeCreated)" -ForegroundColor Red }
     $flags += "Security event log risulta svuotato manualmente (Event ID 1102)"
@@ -76,7 +85,6 @@ if ($secCleared) {
     Write-Host "  Security log: nessuna cancellazione registrata (Event ID 1102 non trovato)"
 }
 
-$sysCleared = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104} -MaxEvents 5 -ErrorAction SilentlyContinue
 if ($sysCleared) {
     foreach ($e in $sysCleared) { Write-Host "  System log cleared at: $($e.TimeCreated)" -ForegroundColor Red }
     $flags += "System event log risulta svuotato manualmente (Event ID 104)"
@@ -84,10 +92,8 @@ if ($sysCleared) {
     Write-Host "  System log: nessuna cancellazione registrata (Event ID 104 non trovato)"
 }
 
-$shutdown = Get-WinEvent -FilterHashtable @{LogName='System'; Id=1074,6006} -MaxEvents 1 -ErrorAction SilentlyContinue
 if ($shutdown) { Write-Host "  Last PC Shutdown at: $($shutdown.TimeCreated)" }
 
-$timeChange = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4616} -MaxEvents 1 -ErrorAction SilentlyContinue
 if ($timeChange) {
     Write-Host "  System time changed at: $($timeChange.TimeCreated)" -ForegroundColor Yellow
     $flags += "Rilevato cambio manuale dell'orologio di sistema (Event ID 4616) - possibile tentativo di alterare timestamp"
@@ -123,18 +129,24 @@ if ($usn -match "not found" -or $usn -match "non trovato" -or $LASTEXITCODE -ne 
     }
 }
 
-Write-Host "`nPREFETCH INTEGRITY" -ForegroundColor Cyan
+Write-Host "`nPREFETCH" -ForegroundColor Cyan
 $pfPath = "$env:WINDIR\Prefetch"
+Write-Host "  Enabled: $(if ($prefetch -gt 0) {'Si'} else {'No'})"
 if (Test-Path $pfPath) {
-    $pfFiles = Get-ChildItem -Path $pfPath -Filter *.pf -File -ErrorAction SilentlyContinue
-    Write-Host "  File .pf trovati: $($pfFiles.Count)"
-    $hidden = $pfFiles | Where-Object { $_.Attributes -match 'Hidden' }
-    $ro = $pfFiles | Where-Object { $_.IsReadOnly }
-    Write-Host "  Hidden Files: $($hidden.Count)"
-    Write-Host "  Read-Only Files: $($ro.Count)"
-    if ($pfFiles.Count -eq 0) { $flags += "Cartella Prefetch vuota - possibile pulizia manuale o Prefetch disabilitato da tempo" }
+    Write-Host "  Path: $pfPath"
 } else {
-    Write-Host "  Cartella Prefetch non accessibile" -ForegroundColor Red
+    Write-Host "  Path non trovato (cartella rinominata/spostata o accesso negato)" -ForegroundColor Yellow
+    $flags += "Cartella Prefetch non trovata al percorso standard"
+}
+
+Write-Host "`nSTARTUP ITEMS" -ForegroundColor Cyan
+$startupItems = Get-CimInstance Win32_StartupCommand
+$suspiciousPathPattern = 'AppData\\Local\\Temp|\\Temp\\|Downloads'
+foreach ($s in $startupItems) {
+    $isSuspicious = $s.Command -match $suspiciousPathPattern
+    $c = if ($isSuspicious) { 'Red' } else { 'DarkGray' }
+    Write-Host "  [$($s.Location)] $($s.Name): $($s.Command)" -ForegroundColor $c
+    if ($isSuspicious) { $flags += "Voce di avvio automatico sospetta: $($s.Name) ($($s.Command))" }
 }
 
 Write-Host "`nRECYCLE BIN" -ForegroundColor Cyan
@@ -156,6 +168,22 @@ if ($lastDeleted) {
     Write-Host "  Ultima cancellazione file rilevata da USN Journal: $($lastDeleted.FileName) alle $($lastDeleted.TimeStamp)" -ForegroundColor Yellow
 } elseif ($isAdmin) {
     Write-Host "  Nessuna cancellazione file rilevata nel range del journal analizzato" -ForegroundColor DarkGray
+}
+
+Write-Host "`nSYSTEM BINARY INTEGRITY (calc.exe)" -ForegroundColor Cyan
+$calcPath = "$env:WINDIR\System32\calc.exe"
+if (Test-Path $calcPath) {
+    $calcFile = Get-Item $calcPath
+    $sig = Get-AuthenticodeSignature -FilePath $calcPath
+    Write-Host "  Path: $calcPath"
+    Write-Host "  Last Modified: $($calcFile.LastWriteTime)"
+    Write-Host "  Size: $([math]::Round($calcFile.Length/1KB,2)) KB"
+    $sigColor = if ($sig.Status -eq 'Valid') { 'Green' } else { 'Red' }
+    Write-Host "  Firma digitale: $($sig.Status)" -ForegroundColor $sigColor
+    if ($sig.Status -ne 'Valid') { $flags += "calc.exe non ha una firma digitale valida (Status=$($sig.Status)) - possibile sostituzione/binary planting" }
+} else {
+    Write-Host "  calc.exe non trovato al percorso standard - potrebbe essere stato rinominato/spostato" -ForegroundColor Yellow
+    $flags += "calc.exe assente dal percorso standard System32 - verificare se rinominato o sostituito"
 }
 
 Write-Host "`nCONSOLE HOST HISTORY" -ForegroundColor Cyan
