@@ -1,7 +1,7 @@
 $flags = @()
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host "Attenzione: sessione non elevata - i servizi disabilitati verranno solo segnalati, non riattivati. Rilancia come Amministratore per la remediation automatica." -ForegroundColor DarkYellow
+    Write-Host "Nota: sessione non elevata - la lettura del Security event log potrebbe risultare incompleta. Solo lettura, nessuna modifica verra' applicata." -ForegroundColor DarkYellow
 }
 
 Write-Host "SYSTEM BOOT TIME" -ForegroundColor Cyan
@@ -52,19 +52,6 @@ foreach ($name in $svcNames.Keys) {
         $flags += "$name risulta fermo (potrebbe essere normale o indicare interferenza)"
     }
 
-    if ($svc.StartType -eq 'Disabled' -or $svc.Status -ne 'Running') {
-        if ($isAdmin) {
-            try {
-                if ($svc.StartType -eq 'Disabled') { Set-Service -Name $name -StartupType Automatic -ErrorAction Stop }
-                if ($svc.Status -ne 'Running') { Start-Service -Name $name -ErrorAction Stop }
-                Write-Host "    -> Riattivato: StartType=Automatic, Status=Running" -ForegroundColor Green
-            } catch {
-                Write-Host "    -> Impossibile riattivare $name : $($_.Exception.Message)" -ForegroundColor DarkYellow
-            }
-        } else {
-            Write-Host "    -> Serve PowerShell come Amministratore per riattivarlo automaticamente" -ForegroundColor DarkYellow
-        }
-    }
 }
 
 Write-Host "`nREGISTRY" -ForegroundColor Cyan
