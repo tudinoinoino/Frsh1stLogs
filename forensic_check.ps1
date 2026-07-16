@@ -95,11 +95,32 @@ if ($timeChange) {
 
 $fsutilPath = "$env:WINDIR\System32\fsutil.exe"
 $usn = & $fsutilPath usn queryjournal C: 2>&1
+$lastDeleted = $null
 if ($usn -match "not found" -or $usn -match "non trovato" -or $LASTEXITCODE -ne 0) {
     Write-Host "  USN Journal: non trovato/vuoto" -ForegroundColor Red
     $flags += "USN Journal assente - potrebbe essere stato cancellato (fsutil usn deletejournal) per rimuovere tracce filesystem"
 } else {
     Write-Host "  USN Journal: presente"
+    $nextUsnLine = $usn | Select-String "Next Usn"
+    if ($nextUsnLine -and $isAdmin) {
+        $nextUsn = ($nextUsnLine -replace '\D', '')
+        $startUsn = [int64]$nextUsn - 8000000
+        if ($startUsn -lt 0) { $startUsn = 0 }
+        $raw = & $fsutilPath usn readjournal C: startusn=$startUsn 2>&1
+        $blocks = ($raw -join "`n") -split "(?=Usn\s*:)"
+        $deletions = foreach ($b in $blocks) {
+            if ($b -match 'Reason\s*:\s*.*FileDelete') {
+                $fn = if ($b -match 'File name\s*:\s*(.+)') { $matches[1].Trim() } else { $null }
+                $ts = if ($b -match 'Time [Ss]tamp\s*:\s*(.+)') { $matches[1].Trim() } else { $null }
+                if ($fn -and $ts) {
+                    [PSCustomObject]@{ FileName = $fn; TimeStamp = ($ts -as [datetime]) }
+                }
+            }
+        }
+        $lastDeleted = $deletions | Sort-Object TimeStamp -Descending | Select-Object -First 1
+    } elseif (-not $isAdmin) {
+        Write-Host "  (serve sessione Amministratore per leggere il dettaglio del journal ed elencare l'ultimo file eliminato)" -ForegroundColor DarkYellow
+    }
 }
 
 Write-Host "`nPREFETCH INTEGRITY" -ForegroundColor Cyan
@@ -121,9 +142,20 @@ $shell = New-Object -ComObject Shell.Application
 $recycleBin = $shell.Namespace(0xA)
 $items = $recycleBin.Items()
 Write-Host "  Total Items: $($items.Count)"
-if ($items.Count -eq 0) {
+if ($items.Count -gt 0) {
+    $lastItem = $items | Sort-Object { $recycleBin.GetDetailsOf($_, 2) -as [datetime] } -Descending | Select-Object -First 1
+    if ($lastItem) {
+        Write-Host "  Ultimo file eliminato ancora nel cestino: $($lastItem.Name)"
+        Write-Host "  Data eliminazione: $($recycleBin.GetDetailsOf($lastItem, 2))"
+    }
+} else {
     Write-Host "  Cestino vuoto" -ForegroundColor Yellow
     $flags += "Cestino completamente vuoto - possibile svuotamento manuale recente (verificare se coerente con l'uso normale)"
+}
+if ($lastDeleted) {
+    Write-Host "  Ultima cancellazione file rilevata da USN Journal: $($lastDeleted.FileName) alle $($lastDeleted.TimeStamp)" -ForegroundColor Yellow
+} elseif ($isAdmin) {
+    Write-Host "  Nessuna cancellazione file rilevata nel range del journal analizzato" -ForegroundColor DarkGray
 }
 
 Write-Host "`nCONSOLE HOST HISTORY" -ForegroundColor Cyan
