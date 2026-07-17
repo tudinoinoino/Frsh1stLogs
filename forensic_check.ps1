@@ -80,14 +80,14 @@ $timeChange = $secEvents | Where-Object Id -eq 4616 | Select-Object -First 1
 
 if ($secCleared) {
     foreach ($e in $secCleared) { Write-Host "  Security log cleared at: $($e.TimeCreated)" -ForegroundColor Red }
-    $flags += "Security event log risulta svuotato manualmente (Event ID 1102)"
+    $flags += "Security event log risulta svuotato manualmente (Event ID 1102) - FONDAMENTALE: se coincide con l'orario del controllo, e' BAN per pulizia"
 } else {
     Write-Host "  Security log: nessuna cancellazione registrata (Event ID 1102 non trovato)"
 }
 
 if ($sysCleared) {
     foreach ($e in $sysCleared) { Write-Host "  System log cleared at: $($e.TimeCreated)" -ForegroundColor Red }
-    $flags += "System event log risulta svuotato manualmente (Event ID 104)"
+    $flags += "System event log risulta svuotato manualmente (Event ID 104) - FONDAMENTALE: se coincide con l'orario del controllo, e' BAN per pulizia"
 } else {
     Write-Host "  System log: nessuna cancellazione registrata (Event ID 104 non trovato)"
 }
@@ -96,7 +96,55 @@ if ($shutdown) { Write-Host "  Last PC Shutdown at: $($shutdown.TimeCreated)" }
 
 if ($timeChange) {
     Write-Host "  System time changed at: $($timeChange.TimeCreated)" -ForegroundColor Yellow
-    $flags += "Rilevato cambio manuale dell'orologio di sistema (Event ID 4616) - possibile tentativo di alterare timestamp"
+    $flags += "Rilevato cambio manuale dell'orologio di sistema (Event ID 4616) - possibile tentativo di alterare timestamp per camuffare i log"
+}
+
+Write-Host "`nPROCESS CREATION (Event ID 4688)" -ForegroundColor Cyan
+$procEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4688} -MaxEvents 50 -ErrorAction SilentlyContinue
+if ($procEvents) {
+    $suspiciousProcPattern = 'cmd\.exe|powershell\.exe|pwsh\.exe|\.bat$|\.ps1$|cheat|inject'
+    $suspiciousProcs = $procEvents | Where-Object { $_.Message -match $suspiciousProcPattern }
+    foreach ($e in ($suspiciousProcs | Select-Object -First 10)) {
+        $nameLine = ($e.Message -split "`n" | Select-String 'New Process Name' | Select-Object -First 1)
+        Write-Host "  $($e.TimeCreated): $($nameLine -replace '^\s+','')" -ForegroundColor Yellow
+    }
+    if ($suspiciousProcs) {
+        $flags += "Rilevati avvii di processi sospetti (cmd/powershell/script .bat/.ps1/cheat) via Event ID 4688 - $($suspiciousProcs.Count) occorrenze"
+    } else {
+        Write-Host "  Nessun processo sospetto rilevato tra gli ultimi eventi 4688"
+    }
+} else {
+    Write-Host "  Nessun evento 4688 trovato (Auditing avvio processi probabilmente non attivo su questo PC)" -ForegroundColor DarkGray
+}
+
+Write-Host "`nSERVICE STATE CHANGES (Event ID 7036)" -ForegroundColor Cyan
+$svcEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=7036} -MaxEvents 100 -ErrorAction SilentlyContinue
+if ($svcEvents) {
+    $criticalSvcPattern = 'Windows Event Log|Windows Defender|Security Center|Sense|WinDefend'
+    $criticalSvcStops = $svcEvents | Where-Object { $_.Message -match $criticalSvcPattern -and $_.Message -match 'stopped' }
+    foreach ($e in ($criticalSvcStops | Select-Object -First 10)) {
+        $msgOneLine = $e.Message -replace "`n", ' '
+        Write-Host "  $($e.TimeCreated): $msgOneLine" -ForegroundColor Red
+    }
+    if ($criticalSvcStops) {
+        $flags += "Rilevato arresto forzato di servizi critici di log/sicurezza (Event ID 7036) - $($criticalSvcStops.Count) occorrenze"
+    } else {
+        Write-Host "  Nessun arresto sospetto di servizi critici tra gli ultimi eventi 7036"
+    }
+} else {
+    Write-Host "  Nessun evento 7036 trovato" -ForegroundColor DarkGray
+}
+
+Write-Host "`nUSB REMOVABLE STORAGE (Event ID 2003/2102)" -ForegroundColor Cyan
+$usbEvents = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-DriverFrameworks-UserMode/Operational'; Id=2003,2102} -MaxEvents 20 -ErrorAction SilentlyContinue
+if ($usbEvents) {
+    foreach ($e in $usbEvents) {
+        $action = if ($e.Id -eq 2003) { 'Inserita' } else { 'Rimossa' }
+        Write-Host "  $($e.TimeCreated): chiavetta USB $action (Event ID $($e.Id))" -ForegroundColor Yellow
+    }
+    $flags += "Rilevati $($usbEvents.Count) eventi di inserimento/rimozione USB (ID 2003/2102) - verificare se coincidono con l'orario del controllo (possibile chiavetta con cheat)"
+} else {
+    Write-Host "  Nessun evento USB trovato nel log DriverFrameworks-UserMode/Operational" -ForegroundColor DarkGray
 }
 
 $fsutilPath = "$env:WINDIR\System32\fsutil.exe"
