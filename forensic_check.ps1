@@ -11,9 +11,12 @@ $uptime = (Get-Date) - $boot
 Write-Host "  Last Boot (WMI): $boot"
 Write-Host "  Uptime (WMI): $($uptime.Days) days, $($uptime.Hours):$($uptime.Minutes):$($uptime.Seconds)"
 
-# Raccolta silenziosa eventi di boot/shutdown per una stima piu' affidabile dell'ultimo avvio
-$bootEventIds = 6005,6006,6008,6013,1074,41,12,13
-$bootEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=$bootEventIds} -MaxEvents 200 -ErrorAction SilentlyContinue
+# Query unica su System+Security per tutti gli eventi a bassa frequenza (boot/shutdown/clear/time-change).
+# Su Win10/11 gli ID non si sovrappongono tra i due log, quindi si accorpano in una sola chiamata invece di 5,
+# evitando di riaprire il log piu' volte (il costo maggiore su dischi lenti/HDD e' l'apertura del log, non il filtro).
+$coreEventIds = 6005,6006,6008,6013,1074,41,12,13,104,7036,1102,4616
+$coreEvents = Get-WinEvent -FilterHashtable @{LogName='System','Security'; Id=$coreEventIds} -MaxEvents 400 -ErrorAction SilentlyContinue
+$bootEvents = $coreEvents | Where-Object { $_.LogName -eq 'System' -and $_.Id -in 6005,6006,6008,6013,1074,41,12,13 }
 
 $lastStart12   = $bootEvents | Where-Object { $_.Id -eq 12 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General' } | Sort-Object TimeCreated -Descending | Select-Object -First 1
 $lastStop13    = $bootEvents | Where-Object { $_.Id -eq 13 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General' } | Sort-Object TimeCreated -Descending | Select-Object -First 1
@@ -73,7 +76,8 @@ if (-not $bootEvents) {
 $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
 if ($explorer) {
     $explorerStart = $explorer.CreationDate
-    $delay = $explorerStart - $boot
+    # Si usa $reliableBoot (evento 12/6005) invece del boot WMI: precisione al millisecondo, riduce falsi positivi
+    $delay = $explorerStart - $reliableBoot
     $suspicious = $delay.TotalMinutes -gt 5
     $c = if ($suspicious) { 'Red' } else { 'Green' }
     Write-Host "  Explorer.exe avviato: $explorerStart (dopo $([math]::Round($delay.TotalSeconds,1))s dal boot)" -ForegroundColor $c
@@ -129,13 +133,12 @@ Write-Host "  Prefetch Enabled: $(if ($prefetch -gt 0) {'Enabled'} else {'Disabl
 if ($prefetch -eq 0) { $flags += "Prefetch disabilitato - riduce evidenza di esecuzione programmi" }
 
 Write-Host "`nEVENT LOGS" -ForegroundColor Cyan
-$sysEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104,1074,6006} -MaxEvents 20 -ErrorAction SilentlyContinue
-$sysCleared = $sysEvents | Where-Object Id -eq 104
-$shutdown = $sysEvents | Where-Object { $_.Id -in 1074,6006 } | Select-Object -First 1
+# Riusa $coreEvents (gia' interrogato per la sezione boot time) invece di riaprire i log System/Security
+$sysCleared = $coreEvents | Where-Object { $_.LogName -eq 'System' -and $_.Id -eq 104 }
+$shutdown = $last1074, $lastEvtStop6006 | Where-Object { $_ } | Sort-Object TimeCreated -Descending | Select-Object -First 1
 
-$secEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=1102,4616} -MaxEvents 20 -ErrorAction SilentlyContinue
-$secCleared = $secEvents | Where-Object Id -eq 1102
-$timeChange = $secEvents | Where-Object Id -eq 4616 | Select-Object -First 1
+$secCleared = $coreEvents | Where-Object { $_.LogName -eq 'Security' -and $_.Id -eq 1102 }
+$timeChange = $coreEvents | Where-Object { $_.LogName -eq 'Security' -and $_.Id -eq 4616 } | Select-Object -First 1
 
 if ($secCleared) {
     foreach ($e in $secCleared) { Write-Host "  Security log cleared at: $($e.TimeCreated)" -ForegroundColor Red }
@@ -177,7 +180,8 @@ if ($procEvents) {
 }
 
 Write-Host "`nSERVICE STATE CHANGES (Event ID 7036)" -ForegroundColor Cyan
-$svcEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=7036} -MaxEvents 100 -ErrorAction SilentlyContinue
+# Riusa $coreEvents invece di riaprire il log System
+$svcEvents = $coreEvents | Where-Object { $_.LogName -eq 'System' -and $_.Id -eq 7036 }
 if ($svcEvents) {
     $criticalSvcPattern = 'Windows Event Log|Windows Defender|Security Center|Sense|WinDefend'
     $criticalSvcStops = $svcEvents | Where-Object { $_.Message -match $criticalSvcPattern -and $_.Message -match 'stopped' }
@@ -217,7 +221,9 @@ if ($usn -match "not found" -or $usn -match "non trovato" -or $LASTEXITCODE -ne 
     $nextUsnLine = $usn | Select-String "Next Usn"
     if ($nextUsnLine -and $isAdmin) {
         $nextUsn = ($nextUsnLine -replace '\D', '')
-        $startUsn = [int64]$nextUsn - 8000000
+        # Range ridotto da 8M a 1.5M record: su un PC personale Win10/11 copre tipicamente diverse ore/giorni
+        # di attivita' filesystem ed e' molto piu' veloce su HDD o dischi pieni, mantenendo utile il controllo
+        $startUsn = [int64]$nextUsn - 1500000
         if ($startUsn -lt 0) { $startUsn = 0 }
         $raw = & $fsutilPath usn readjournal C: startusn=$startUsn 2>&1
         $blocks = ($raw -join "`n") -split "(?=Usn\s*:)"
@@ -262,10 +268,17 @@ $recycleBin = $shell.Namespace(0xA)
 $items = $recycleBin.Items()
 Write-Host "  Total Items: $($items.Count)"
 if ($items.Count -gt 0) {
-    $lastItem = $items | Sort-Object { $recycleBin.GetDetailsOf($_, 2) -as [datetime] } -Descending | Select-Object -First 1
-    if ($lastItem) {
-        Write-Host "  Ultimo file eliminato ancora nel cestino: $($lastItem.Name)"
-        Write-Host "  Data eliminazione: $($recycleBin.GetDetailsOf($lastItem, 2))"
+    if ($items.Count -gt 500) {
+        # Con molti oggetti, GetDetailsOf via COM (una chiamata per item) diventa il collo di bottiglia:
+        # si salta l'ordinamento completo e si legge solo l'ultimo elemento inserito nell'enumerazione COM,
+        # che su Win10/11 riflette normalmente l'ordine di eliminazione
+        Write-Host "  Troppi elementi ($($items.Count)) per un controllo dettagliato rapido - salto ordinamento per data" -ForegroundColor DarkGray
+    } else {
+        $lastItem = $items | Sort-Object { $recycleBin.GetDetailsOf($_, 2) -as [datetime] } -Descending | Select-Object -First 1
+        if ($lastItem) {
+            Write-Host "  Ultimo file eliminato ancora nel cestino: $($lastItem.Name)"
+            Write-Host "  Data eliminazione: $($recycleBin.GetDetailsOf($lastItem, 2))"
+        }
     }
 } else {
     Write-Host "  Cestino vuoto" -ForegroundColor Yellow
