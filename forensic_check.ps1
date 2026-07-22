@@ -8,8 +8,67 @@ Write-Host "SYSTEM BOOT TIME" -ForegroundColor Cyan
 $os = Get-CimInstance Win32_OperatingSystem
 $boot = $os.LastBootUpTime
 $uptime = (Get-Date) - $boot
-Write-Host "  Last Boot: $boot"
-Write-Host "  Uptime: $($uptime.Days) days, $($uptime.Hours):$($uptime.Minutes):$($uptime.Seconds)"
+Write-Host "  Last Boot (WMI): $boot"
+Write-Host "  Uptime (WMI): $($uptime.Days) days, $($uptime.Hours):$($uptime.Minutes):$($uptime.Seconds)"
+
+# Raccolta silenziosa eventi di boot/shutdown per una stima piu' affidabile dell'ultimo avvio
+$bootEventIds = 6005,6006,6008,6013,1074,41,12,13
+$bootEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=$bootEventIds} -MaxEvents 200 -ErrorAction SilentlyContinue
+
+$lastStart12   = $bootEvents | Where-Object { $_.Id -eq 12 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General' } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$lastStop13    = $bootEvents | Where-Object { $_.Id -eq 13 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-General' } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$lastEvtStart6005 = $bootEvents | Where-Object { $_.Id -eq 6005 } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$lastEvtStop6006  = $bootEvents | Where-Object { $_.Id -eq 6006 } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$lastDirty6008    = $bootEvents | Where-Object { $_.Id -eq 6008 } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$lastUnexpected41 = $bootEvents | Where-Object { $_.Id -eq 41 }   | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$last1074      = $bootEvents | Where-Object { $_.Id -eq 1074 } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+$last6013      = $bootEvents | Where-Object { $_.Id -eq 6013 } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+
+# Priorita': Kernel-General ID 12 (piu' preciso, include millisecondi) > EventLog ID 6005 > WMI
+$reliableBoot = $null
+$reliableSource = $null
+if ($lastStart12) {
+    $reliableBoot = $lastStart12.TimeCreated
+    $reliableSource = "Event ID 12 (Kernel-General, avvio kernel)"
+} elseif ($lastEvtStart6005) {
+    $reliableBoot = $lastEvtStart6005.TimeCreated
+    $reliableSource = "Event ID 6005 (avvio servizio Event Log)"
+} else {
+    $reliableBoot = $boot
+    $reliableSource = "WMI Win32_OperatingSystem.LastBootUpTime (nessun evento 12/6005 disponibile)"
+}
+
+Write-Host "  Ultimo Boot (piu' affidabile): $reliableBoot" -ForegroundColor Green
+Write-Host "  Fonte: $reliableSource"
+
+$deltaWmi = [math]::Abs(($reliableBoot - $boot).TotalSeconds)
+if ($deltaWmi -gt 60) {
+    Write-Host "  Discrepanza tra boot time da evento e da WMI: $([math]::Round($deltaWmi,1))s" -ForegroundColor Red
+    $flags += "Il Last Boot Time da evento log ($reliableSource) differisce di oltre 60s da quello riportato da WMI - possibile manipolazione dell'orologio di sistema o del log"
+}
+
+if ($lastUnexpected41 -and $lastUnexpected41.TimeCreated -lt $reliableBoot -and ((New-TimeSpan -Start $lastUnexpected41.TimeCreated -End $reliableBoot).TotalMinutes -lt 15)) {
+    Write-Host "  Riavvio precedente non pulito (Event ID 41 - Kernel-Power) rilevato poco prima dell'ultimo boot: $($lastUnexpected41.TimeCreated)" -ForegroundColor Yellow
+    $flags += "Rilevato spegnimento anomalo/non pianificato (Event ID 41, Kernel-Power) poco prima dell'ultimo avvio - possibile crash, distacco alimentazione o hard reset"
+}
+
+if ($lastDirty6008) {
+    Write-Host "  Precedente spegnimento inaspettato rilevato (Event ID 6008): $($lastDirty6008.TimeCreated)" -ForegroundColor Yellow
+    $flags += "Rilevato spegnimento inaspettato precedente (Event ID 6008) - il sistema non e' stato chiuso correttamente in un'occasione passata"
+}
+
+if ($last1074) {
+    Write-Host "  Ultimo arresto/riavvio pianificato dall'utente (Event ID 1074): $($last1074.TimeCreated)"
+}
+if ($lastEvtStop6006) {
+    Write-Host "  Ultimo arresto pulito registrato (Event ID 6006): $($lastEvtStop6006.TimeCreated)"
+}
+if ($last6013) {
+    Write-Host "  Ultimo report uptime giornaliero (Event ID 6013): $($last6013.TimeCreated)"
+}
+if (-not $bootEvents) {
+    Write-Host "  Nessun evento di boot/shutdown (6005/6006/6008/6013/1074/41/12/13) trovato nel System log" -ForegroundColor DarkGray
+}
 
 $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
 if ($explorer) {
